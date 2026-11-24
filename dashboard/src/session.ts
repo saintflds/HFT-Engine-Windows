@@ -71,6 +71,30 @@ export interface CollectorFacts {
   truncated_stream_recovered?: boolean;
 }
 
+/** Native Sierra provenance; separate from the crypto websocket collector. */
+export interface SierraFacts {
+  source: string;
+  source_note: string;
+  source_mode?: 'quotes' | 'depth';
+  trade_file: string;
+  depth_file: string | null;
+  first_ns: string;
+  last_ns_exclusive: string;
+  trade_records: number;
+  depth_records: number;
+  depth_batches: number;
+  initial_bid_levels: number;
+  initial_ask_levels: number;
+  quote_records?: number;
+  quote_changes?: number;
+  quotes_modeled?: boolean;
+  full_depth?: boolean;
+  assumed_quote_quantity?: number;
+  feed_latency_measured: boolean;
+  modeled_order_latency_us?: number[];
+  npz?: { file: string; bytes: number; rows: number };
+}
+
 function arr<T extends keyof ArrayTypes>(h: Hbr, name: string): ArrayTypes[T] {
   const a = h.arrays.get(name);
   if (!a) throw new Error(`recording is missing array ${name}`);
@@ -95,6 +119,9 @@ export class Session {
   readonly levels: number;
   readonly nFrames: number;
   readonly endT: number;
+  private readonly balanceFrames: Float64Array | null;
+  private readonly feeFrames: Float64Array | null;
+  private readonly finalAccounting: {position:number;fills:number;balance:number;fees:number;markPrice:number;equity:number} | null;
 
   // frames
   readonly frameT: Float64Array;
@@ -156,6 +183,7 @@ export class Session {
   readonly fillEvents: number[] = [];
 
   collector: CollectorFacts | null = null;
+  sierraCollector: SierraFacts | null = null;
 
   constructor(h: Hbr) {
     this.meta = h.meta;
@@ -215,7 +243,31 @@ export class Session {
     this.eExecTick = arr<"i32">(h, "e_exec_tick");
     this.eTradedAtLevel = arr<"f32">(h, "e_traded_at_level");
 
-    this.endT = this.frameT.length ? this.frameT[this.frameT.length - 1] : 0;
+    const lastValid = (values: ArrayLike<number>): number => {
+      for (let i = values.length - 1; i >= 0; i--) if (Number.isFinite(values[i]) && values[i] >= 0 && values[i] <= Number.MAX_SAFE_INTEGER) return values[i];
+      return 0;
+    };
+    const observedEnd = Math.max(lastValid(this.frameT), lastValid(this.eT), lastValid(this.trLocalT));
+    let declaredEnd = 0;
+    try {
+      const relative = BigInt(this.meta.t_end_ns) - this.t0;
+      if (relative >= 0n && relative <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        const candidate = Number(relative);
+        // The recorder may finish between frames. Reject a remote metadata-only
+        // end beyond one frame after the actual recorded events/trades.
+        if (candidate >= observedEnd && candidate - observedEnd <= this.frameNs) declaredEnd = candidate;
+      }
+    } catch { /* Older recordings may not declare a terminal timestamp. */ }
+    this.endT = this.meta.live ? lastValid(this.frameT) : Math.max(observedEnd, declaredEnd);
+    this.balanceFrames = h.arrays.get('balance')?.data instanceof Float64Array ? h.arrays.get('balance')!.data as Float64Array : null;
+    this.feeFrames = h.arrays.get('fee')?.data instanceof Float64Array ? h.arrays.get('fee')!.data as Float64Array : null;
+    const run = this.meta.run;
+    const totalFills = this.eKind.reduce((n, kind) => n + (kind === EV.FILL ? 1 : 0), 0);
+    this.finalAccounting = !this.meta.live && run
+      && [run.final_position, run.balance, run.fees, run.mark_price, run.equity].every((v: unknown) => typeof v === 'number' && Number.isFinite(v))
+      && Number.isSafeInteger(run.fills) && run.fills === totalFills && run.fees >= 0 && run.mark_price > 0
+      ? {position:run.final_position,fills:run.fills,balance:run.balance,fees:run.fees,markPrice:run.mark_price,equity:run.equity}
+      : null;
     this.lifeIndexOfEvent = new Int32Array(this.eT.length).fill(-1);
     this.buildLives();
   }
@@ -337,15 +389,24 @@ export class Session {
   }
 
   // ---------------------------------------------------------------- queries
+  /** Accounting is sampled until the terminal boundary. Final metadata never
+   * replaces an earlier frame, so rewind cannot expose future terminal state. */
+  accountingAt(t: number): {terminal:boolean;position:number;fills:number;balance:number|null;fees:number|null;markPrice:number;equity:number|null} {
+    if (!this.meta.live && this.finalAccounting && t >= this.endT) return {terminal:true,...this.finalAccounting};
+    const f = this.frameAt(t), position = this.position[f] ?? 0;
+    const balance = this.balanceFrames?.[f] ?? null, fees = this.feeFrames?.[f] ?? null;
+    const markPrice = (this.bestBidTick[f] + this.bestAskTick[f]) * this.tickSize / 2;
+    const multiplier = this.meta.models?.asset?.contract_size ?? this.meta.contract_size ?? 1;
+    const linear = this.meta.models?.asset?.kind === 'LinearAsset';
+    return {terminal:false,position,fills:this.numTrades[f]??0,balance,fees,markPrice,
+      equity:linear && balance !== null && fees !== null ? balance + position * markPrice * multiplier - fees : null};
+  }
+
   /** Index of the last frame whose time is <= t (0 if before the first). */
   frameAt(t: number): number {
-    const f = Math.floor(t / this.frameNs);
-    if (f < 0) return 0;
-    if (f >= this.nFrames) return this.nFrames - 1;
-    // guard against gaps: walk back while frameT[f] > t
-    let i = f;
-    while (i > 0 && this.frameT[i] > t) i--;
-    return i;
+    // Live snapshots have irregular times, and rolling buffers can start long
+    // after t=0. The recorded timestamps are the authority for both modes.
+    return Math.max(0, upperBound(this.frameT, t) - 1);
   }
 
   /** Number of market trades with local receipt time <= t. */

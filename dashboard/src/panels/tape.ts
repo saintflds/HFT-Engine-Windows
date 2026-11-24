@@ -37,7 +37,7 @@ export class TapePanel extends Panel {
         sp("w", rj(s.trQty[i].toFixed(this.qd), 8)) +
         " " +
         sp(cls, tag) +
-        (wide ? sp("d", `  rx +${((s.trLocalT[i] - s.trExchT[i]) / 1e6).toFixed(1)}ms`) : "");
+        (wide && !s.meta.live ? sp("d", `  rx +${((s.trLocalT[i] - s.trExchT[i]) / 1e6).toFixed(1)}ms`) : "");
       list.push({ t, html: line });
     }
     const tMin = list.length ? list[list.length - 1].t : -Infinity;

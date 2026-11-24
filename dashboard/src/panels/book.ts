@@ -18,15 +18,21 @@ export type LadderMode = "levels" | "ticks";
 export class BookPanel extends Panel {
   private readonly pxd: number;
   private readonly qd: number;
+  private readonly sierraSession: boolean;
+  private readonly quotesOnly: boolean;
   mode: LadderMode = "levels";
 
   constructor(s: Session) {
     super("book", 1, "BOOK", s);
     this.pxd = tickDigits(s.tickSize);
     this.qd = lotDigits(s.lotSize);
+    this.sierraSession = s.sierraCollector !== null || String(s.meta.source_note ?? "").includes("Sierra");
+    this.quotesOnly = s.sierraCollector?.source_mode === "quotes" || s.sierraCollector?.full_depth === false || s.sierraCollector?.quotes_modeled === true;
+    if (this.sierraSession) this.mode = "ticks";
     this.body.classList.add("ladder");
     const m = new URLSearchParams(location.search).get("ladder");
     if (m === "ticks" || m === "levels") this.mode = m;
+    if (this.sierraSession) this.body.title = "Dim prices are reference tick prices. Blank quantities are unavailable, not zero. OURS / queue bars are model estimates.";
   }
 
   render(c: RenderCtx): void {
@@ -38,7 +44,7 @@ export class BookPanel extends Panel {
     for (let i = tradeN - 1; i >= 0 && s.trLocalT[i] > c.t - 150e6; i--) hits.set(s.trTick[i], s.trSide[i]);
     const evN = s.eventsUpTo(c.t);
     const fills = new Set<number>();
-    for (let i = evN - 1; i >= 0 && s.eT[i] > c.t - 600e6; i--) if (s.eKind[i] === 3) fills.add(s.eExecTick[i]);
+    for (let i = evN - 1; !s.meta.live?.followSierra && i >= 0 && s.eT[i] > c.t - 600e6; i--) if (s.eKind[i] === 3) fills.add(s.eExecTick[i]);
     const rows = this.rows;
     const key = `${f}|${rows}|${this.cols}|${this.mode}|${[...hits.keys()].join(",")}|${[...fills].join(",")}`;
     if (!this.changed(key)) return;
@@ -51,7 +57,7 @@ export class BookPanel extends Panel {
     const { bids, asks } = s.bookAt(f);
     const [o0, o1] = s.orderRange(f);
     const ours = new Map<number, { qty: number; leaves: number; front: number; level: number; status: number; req: number; side: number }>();
-    for (let i = o0; i < o1; i++) {
+    for (let i = o0; !s.meta.live?.followSierra && i < o1; i++) {
       ours.set(s.oTick[i], {
         qty: s.oQty[i],
         leaves: s.oLeaves[i],
@@ -63,6 +69,7 @@ export class BookPanel extends Panel {
       });
     }
 
+    if(s.meta.live?.followSierra)for(const order of s.meta.live.sierraAccount?.orders??[])if(order.working&&order.price>0){const tick=Math.round(order.price/s.tickSize),old=ours.get(tick);ours.set(tick,{qty:(old?.qty??0)+order.quantity,leaves:(old?.leaves??0)+order.quantity-order.filled,front:NaN,level:NaN,status:1,req:0,side:order.side==='buy'?1:-1});}
     const nAsk = Math.floor((rows - 1) / 2);
     const nBid = rows - 1 - nAsk;
 
@@ -138,7 +145,8 @@ export class BookPanel extends Panel {
         oursTxt = (glyph + o.leaves.toFixed(this.qd)).padStart(OURS_W);
         oursCls = pending || cxl ? "d" : "ours";
       }
-      const pxCls = o ? "ours" : isBest ? "w" : side === 1 ? "bid" : "ask";
+      const observed = (side === 1 ? bids : asks).has(tick);
+      const pxCls = o ? "ours" : isBest ? "w" : this.sierraSession && !observed ? "d" : side === 1 ? "bid" : "ask";
       const pxHtml = fills.has(tick)
         ? `<span class="fill-flash">${esc(pxs.padStart(PX_W))}</span>`
         : hit !== undefined
@@ -152,7 +160,7 @@ export class BookPanel extends Panel {
       } else {
         txt = " ".repeat(OURS_W + 1 + QTY_W + 1) + pxHtml + " " + sp(qtyCls, qs.padEnd(QTY_W)) + " " + sp(oursCls, oursTxt.trimStart().padEnd(OURS_W));
       }
-      out.push(`<div class="row${isBest ? " best" : ""}">${bars}<div class="txt">${txt}</div></div>`);
+      out.push(`<div class="row${isBest ? " best" : ""}" data-observed="${observed}">${bars}<div class="txt">${txt}</div></div>`);
     };
 
     for (let i = askTicks.length - 1; i >= 0; i--) row(askTicks[i], -1, askTicks[i] === ba);
@@ -166,6 +174,7 @@ export class BookPanel extends Panel {
 
     const bq = bids.get(bb) ?? 0;
     const aq = asks.get(ba) ?? 0;
-    this.setTitle(`${num(bq, this.qd)} x ${num(aq, this.qd)} @ ${(bb * s.tickSize).toFixed(this.pxd)}/${(ba * s.tickSize).toFixed(this.pxd)}`);
+    this.setTitle(this.quotesOnly ? "TOP QUOTES · DEPTH UNAVAILABLE"
+      : `${num(bq, this.qd)} x ${num(aq, this.qd)} @ ${(bb * s.tickSize).toFixed(this.pxd)}/${(ba * s.tickSize).toFixed(this.pxd)}`);
   }
 }

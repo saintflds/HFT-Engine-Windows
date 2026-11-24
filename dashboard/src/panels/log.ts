@@ -1,3 +1,4 @@
+import {sierraPanel} from '../sierra-panels';
 /** LOG: order lifecycle as the local side saw it — submissions, acceptances (with entry latency
  * and queue ahead), fills, cancels, post-only rejections. Newest at the bottom. */
 import { sp } from "../dom";
@@ -17,11 +18,14 @@ export class LogPanel extends Panel {
 
   render(c: RenderCtx): void {
     const s = this.s;
+    const account=sierraPanel(s,'log');if(account){this.body.innerHTML=account.html;this.setTitle(account.title);return;}
     const evN = s.eventsUpTo(c.t);
     const key = `${evN}|${this.rows}|${this.cols}`;
     if (!this.changed(key)) return;
     const rows = this.rows;
     const out: string[] = [];
+    const marketOrders = new Set<number>((s.meta.live?.sim.events ?? []).filter((event: { market?: boolean }) => event.market)
+      .map((event: { orderId: string }) => Number(event.orderId.replace(/^SIM-/, ''))));
     for (let i = Math.max(0, evN - rows); i < evN; i++) {
       const k = s.eKind[i];
       const side = s.eSide[i] === 1 ? "BUY " : "SELL";
@@ -36,7 +40,8 @@ export class LogPanel extends Panel {
       switch (k) {
         case EV.SUBMIT:
           kcls = "w";
-          body = sp(sideCls, side) + ` ${qty} @ ${px}` + sp("d", ` post-only limit → exchange`);
+          body = sp(sideCls, side) + ` ${qty} @ ${px}` + sp("d", marketOrders.has(s.eId[i])
+            ? ' protective exit → next print + slippage' : s.meta.live ? ' queued limit → modeled book' : ' post-only limit → exchange');
           break;
         case EV.ACK: {
           kcls = "g";
@@ -85,6 +90,7 @@ export class LogPanel extends Panel {
       const name = k === EV.SUBMIT ? "NEW" : k === EV.ACK ? "ACK" : k === EV.FILL ? "FILL" : k === EV.CANCEL_SENT ? "CXL" : k === EV.CANCELED ? "CXLD" : k === EV.EXPIRED ? "REJ" : "CREJ";
       out.push(sp("d", t) + " " + sp(kcls, lj(name, 5)) + body);
     }
+    if(!out.length&&s.meta.live)out.push(sp('d',s.meta.live.sim.status==='off'?'Engine orders OFF — enable Orders above':s.meta.live.sim.decision||'Waiting for engine orders.'));
     this.body.innerHTML = out.join("\n");
     this.setTitle(`${evN} events`);
   }

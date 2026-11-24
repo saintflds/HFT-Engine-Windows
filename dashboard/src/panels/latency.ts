@@ -20,8 +20,12 @@ export class LatencyPanel extends Panel {
     this.pxd = tickDigits(s.tickSize);
     this.top = el("div", "", this.body);
     this.spark = el("canvas", "", this.body);
+    this.spark.setAttribute('role', 'img');
+    this.spark.setAttribute('aria-label', s.meta.live ? 'Snapshot publication age history' : 'Feed latency history');
     this.mid = el("div", "", this.body);
     this.trips = el("canvas", "", this.body);
+    this.trips.setAttribute('role', 'img');
+    this.trips.setAttribute('aria-label', 'Modeled order entry and response delay bars');
     this.foot = el("div", "", this.body);
   }
 
@@ -43,7 +47,7 @@ export class LatencyPanel extends Panel {
     const last = s.feedLast[f];
     const fmax = s.feedMax[f];
     this.top.innerHTML =
-      sp("d", "FEED LATENCY  exchange ts → local receipt   ") +
+      sp("d", s.meta.live ? "SNAPSHOT AGE  publish → browser   " : "FEED LATENCY  exchange ts → local receipt   ") +
       sp("w", `${ms(last * 1e6)} ms`) +
       "\n" +
       sp("d", "frame max ") +
@@ -52,7 +56,7 @@ export class LatencyPanel extends Panel {
       sp("c", `${ms(percentile(sorted, 50) * 1e6)}`) +
       sp("d", " p95 ") +
       sp("c", `${ms(percentile(sorted, 95) * 1e6)} ms`) +
-      sp("d", `  ${s.feedBatches[f]} msg this frame`);
+      sp("d", s.meta.live ? "  measured locally" : `  ${s.feedBatches[f]} msg this frame`);
 
     // sparkline: 1 px per frame (600 frames = 60 s at 100 ms), max envelope + mean
     const sparkRows = Math.max(3, Math.min(6, Math.floor((rows - 10) / 2)));
@@ -61,29 +65,39 @@ export class LatencyPanel extends Panel {
     ctx.fillStyle = cssVar("--blue-dark");
     ctx.fillRect(0, 0, W, H);
     const nF = Math.min(W, Math.floor(WINDOW_NS / s.frameNs));
+    const firstFrame = s.meta.live ? f0 : Math.max(0, f - nF + 1);
+    const xOf = (i: number) => s.meta.live ? Math.round((1 - (c.t - s.frameT[i]) / WINDOW_NS) * (W - 1)) : W - (f - i) - 1;
     let vmax = 0;
-    for (let i = Math.max(0, f - nF + 1); i <= f; i++) if (Number.isFinite(s.feedMax[i])) vmax = Math.max(vmax, s.feedMax[i]);
+    for (let i = firstFrame; i <= f; i++) if (Number.isFinite(s.feedMax[i])) vmax = Math.max(vmax, s.feedMax[i]);
     if (vmax <= 0) vmax = 1;
     const scale = (H - 2) / vmax;
     ctx.fillStyle = cssVar("--ahead-bar");
-    for (let i = Math.max(0, f - nF + 1), x = W - (f - i) - 1; i <= f; i++, x++) {
+    for (let i = firstFrame; i <= f; i++) {
       const v = s.feedMax[i];
       if (!Number.isFinite(v)) continue;
       const h = Math.max(1, Math.round(v * scale));
-      ctx.fillRect(x, H - h, 1, h);
+      ctx.fillRect(xOf(i), H - h, 1, h);
     }
     ctx.fillStyle = cssVar("--cyan");
-    for (let i = Math.max(0, f - nF + 1), x = W - (f - i) - 1; i <= f; i++, x++) {
+    for (let i = firstFrame; i <= f; i++) {
       const v = s.feedMean[i];
       if (!Number.isFinite(v)) continue;
-      ctx.fillRect(x, H - Math.max(1, Math.round(v * scale)), 1, 1);
+      ctx.fillRect(xOf(i), H - Math.max(1, Math.round(v * scale)), 1, 1);
     }
     ctx.fillStyle = cssVar("--gray");
     ctx.font = `8px EGA8`;
     ctx.fillText(`${vmax.toFixed(0)}ms`, 2, 9);
     ctx.fillText("0", 2, H - 2);
-    ctx.fillText("-60s", W - 36, H - 2);
+    ctx.fillText("-60s", 2, H - 2);
+    ctx.fillText("now", W - 28, H - 2);
 
+    if(s.meta.live?.followSierra){
+      this.trips.style.display='none';
+      this.mid.innerHTML=sp('c','SIERRA ORDER TIMING')+'\n'+sp('d','Send / exchange ACK / receive timestamps are not exported.');
+      this.foot.innerHTML=sp('y','Order latency: unavailable')+'\n'+sp('d','Snapshot age above is measured; no modeled bars substituted.');
+      this.setTitle('Measured snapshot age');return;
+    }
+    this.trips.style.display='';
     // ---- order round trips ----
     const nTrip = Math.max(2, rows - sparkRows - 6);
     const trips: { i: number; entry: number; resp: number }[] = [];
@@ -97,15 +111,16 @@ export class LatencyPanel extends Panel {
       trips.push({ i, entry, resp });
     }
     this.mid.innerHTML =
-      sp("d", "ORDER ROUND TRIP  request → ") + sp("c", "matching engine") + sp("d", " → ") + sp("m", "response received");
+      sp("d", s.meta.live ? "ORDER DELAY  request → " : "ORDER ROUND TRIP  request → ") + sp("c", "matching engine") + sp("d", " → ") + sp("m", "response received");
     const tctx = fitCanvas(this.trips, W, nTrip * CH);
-    tctx.fillStyle = cssVar("--blue");
+    tctx.fillStyle = cssVar("--black");
     tctx.fillRect(0, 0, W, this.trips.height);
     let tmax = 1;
     for (const t of trips) tmax = Math.max(tmax, (Number.isFinite(t.entry) ? t.entry : 0) + t.resp);
-    const labelW = 24 * CW;
-    const scaleT = (W - labelW - 8 * CW) / tmax;
-    tctx.font = `16px VGA`;
+    const compact = cols < 50;
+    const labelW = (compact ? 8 : 24) * CW;
+    const scaleT = Math.max(8, W - labelW - (compact ? 64 : 8 * CW)) / tmax;
+    tctx.font = compact ? '8px EGA8' : '16px VGA';
     tctx.textBaseline = "top";
     trips.forEach((t, r) => {
       const y = r * CH;
@@ -114,7 +129,8 @@ export class LatencyPanel extends Panel {
       const side = s.eSide[i] === 1 ? "BUY " : "SELL";
       const px = (s.eTick[i] * s.tickSize).toFixed(this.pxd);
       tctx.fillStyle = s.eKind[i] === EV.FILL ? cssVar("--yellow") : s.eKind[i] === EV.EXPIRED ? cssVar("--red") : cssVar("--gray");
-      tctx.fillText(`${lj(name, 8)} ${side} ${px}`, 0, y);
+      const shortName = name === 'CANCELED' ? 'CXL' : name === 'EXPIRED' ? 'REJ' : name;
+      tctx.fillText(compact ? `${shortName} ${side[0]}` : `${lj(name, 8)} ${side} ${px}`, 0, y);
       let x = labelW;
       if (Number.isFinite(t.entry)) {
         const w = Math.max(1, Math.round(t.entry * scaleT));
@@ -128,7 +144,7 @@ export class LatencyPanel extends Panel {
       x += w2;
       tctx.fillStyle = cssVar("--white");
       const lbl = Number.isFinite(t.entry) ? `${ms(t.entry, 0)}+${ms(t.resp, 0)}ms` : `${ms(t.resp, 0)}ms`;
-      tctx.fillText(lbl, Math.min(x + CW, W - lbl.length * CW), y);
+      tctx.fillText(lbl, Math.min(x + CW, W - lbl.length * (compact ? 8 : CW)), y);
     });
 
     // ---- session stats ----
@@ -150,6 +166,9 @@ export class LatencyPanel extends Panel {
       sp("m", "RESP") +
       sp("d", ` p50 ${rj(ms(percentile(rs, 50)), 6)} p95 ${rj(ms(percentile(rs, 95)), 6)} ms`);
     const lat = s.meta.models.latency;
-    this.setTitle(lat.kind === "IntpOrderLatency" ? "IntpOrderLatency" : `ConstantLatency ${lat.entry_us / 1000}/${lat.response_us / 1000} ms`);
+    this.trips.setAttribute('aria-label', `Modeled order delays. Entry p50 ${ms(percentile(es,50))} ms, response p50 ${ms(percentile(rs,50))} ms. ${trips.map(t=>`${EV_NAME[s.eKind[t.i]]} ${ms(t.entry,1)} + ${ms(t.resp,1)} ms`).join('; ')}`);
+    this.setTitle(lat.kind === 'VariableModeledLatency' ? 'variable · modeled 4–60 ms each way' : s.meta.live ? `orders ${lat.entry_us / 1000}/${lat.response_us / 1000} ms assumed`
+      : lat.kind === "IntpOrderLatency" ? "IntpOrderLatency" : `ConstantLatency ${lat.entry_us / 1000}/${lat.response_us / 1000} ms`);
   }
 }
+

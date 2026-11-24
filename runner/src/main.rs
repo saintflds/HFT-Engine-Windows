@@ -26,9 +26,9 @@ use hftbacktest::{
         assettype::LinearAsset,
         data::{Data, read_npz_file},
         models::{
-            CommonFees, ConstantLatency, IntpOrderLatency, LatencyModel, LogProbQueueFunc2,
+            CommonFees, ConstantLatency, FeeModel, IntpOrderLatency, LatencyModel, LogProbQueueFunc2,
             PowerProbQueueFunc, PowerProbQueueFunc2, PowerProbQueueFunc3, ProbQueueModel,
-            RiskAdverseQueueModel, TradingValueFeeModel,
+            RiskAdverseQueueModel, TradingQtyFeeModel, TradingValueFeeModel,
         },
     },
     prelude::{
@@ -69,7 +69,7 @@ struct Args {
     latency: Option<Vec<PathBuf>>,
 
     /// Constant order latency in microseconds "entry,response" (used when --latency is absent).
-    #[arg(long, value_delimiter = ',', num_args = 2)]
+    #[arg(long, value_delimiter = ',', num_args = 1..=2)]
     const_latency_us: Option<Vec<i64>>,
 
     #[arg(long, default_value = "BTCUSDT")]
@@ -78,11 +78,23 @@ struct Args {
     #[arg(long, default_value = "Binance USDT-M Futures")]
     exchange: String,
 
+    /// Description of the data source and timestamp/latency assumptions, saved in session metadata.
+    #[arg(long)]
+    source_note: Option<String>,
+
     #[arg(long, default_value_t = 0.1)]
     tick_size: f64,
 
     #[arg(long, default_value_t = 0.001)]
     lot_size: f64,
+
+    /// Cash value of one price point per unit (MNQ = 2 USD, NQ = 20 USD).
+    #[arg(long, default_value_t = 1.0)]
+    contract_size: f64,
+
+    /// Cash commission and fees per contract per side. Overrides maker/taker percentage fees.
+    #[arg(long)]
+    fee_per_contract: Option<f64>,
 
     /// Output session file (.hbr).
     #[arg(long, required = true)]
@@ -105,6 +117,7 @@ struct Args {
     ///        ("Queue-Based Market Making in Large Tick Size Assets" tutorial: half spread 0.49 tick,
     ///        grid interval 1 tick).
     /// grid:  grid market making with inventory skew ("High-Frequency Grid Trading" tutorial).
+    /// ema:   9/21 EMA crossover on completed one-minute trade bars, targeting one order quantity.
     #[arg(long, default_value = "queue")]
     strategy: String,
 
@@ -152,6 +165,22 @@ enum Latency {
     Intp(IntpOrderLatency),
 }
 
+/// Preserve the original percentage fee model while allowing futures commissions in cash.
+#[derive(Clone)]
+enum Fees {
+    Value(TradingValueFeeModel<CommonFees>),
+    Quantity(TradingQtyFeeModel<CommonFees>),
+}
+
+impl FeeModel for Fees {
+    fn amount(&self, order: &Order, amount: f64) -> f64 {
+        match self {
+            Fees::Value(model) => model.amount(order, amount),
+            Fees::Quantity(model) => model.amount(order, amount),
+        }
+    }
+}
+
 impl LatencyModel for Latency {
     fn entry(&mut self, timestamp: i64, order: &Order) -> i64 {
         match self {
@@ -194,6 +223,8 @@ struct Buffers {
     ask_tick: Vec<i32>,
     ask_qty: Vec<f32>,
     position: Vec<f32>,
+    balance: Vec<f64>,
+    fee: Vec<f64>,
     num_trades: Vec<i32>,
     volume: Vec<f32>,
     feed_lat_last: Vec<f32>,
@@ -264,8 +295,114 @@ struct DataFileInfo {
     last_local_ts: i64,
 }
 
+/// Decisions use only completed nonempty one-minute bars known to the local bot.
+/// Using trade arrival time keeps the strategy from seeing a delayed trade before it arrives.
+#[derive(Default)]
+struct EmaStrategy {
+    bucket: Option<i64>,
+    completed_bucket: Option<i64>,
+    close: f64,
+    fast: Option<f64>,
+    slow: Option<f64>,
+    completed: usize,
+    target_side: i8,
+}
+
+impl EmaStrategy {
+    const MINUTE_NS: i64 = 60_000_000_000;
+
+    fn observe(&mut self, local_timestamp: i64, price: f64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let bucket = local_timestamp.div_euclid(Self::MINUTE_NS);
+        if self.completed_bucket.is_some_and(|completed| bucket <= completed)
+            || self.bucket.is_some_and(|open| bucket < open)
+        {
+            return;
+        }
+        if self.bucket.is_some_and(|open| bucket > open) {
+            self.complete();
+        }
+        self.bucket = Some(bucket);
+        self.close = price;
+    }
+
+    fn advance(&mut self, local_timestamp: i64) {
+        if self.bucket.is_some_and(|open| local_timestamp.div_euclid(Self::MINUTE_NS) > open) {
+            self.complete();
+        }
+    }
+
+    fn complete(&mut self) {
+        let Some(bucket) = self.bucket.take() else { return; };
+        let previous = self.fast.zip(self.slow).map(|(fast, slow)| fast - slow);
+        let fast = self.fast.map_or(self.close, |value| value + (self.close - value) * 2.0 / 10.0);
+        let slow = self.slow.map_or(self.close, |value| value + (self.close - value) * 2.0 / 22.0);
+        self.fast = Some(fast);
+        self.slow = Some(slow);
+        self.completed += 1;
+        self.completed_bucket = Some(bucket);
+        if self.completed >= 21 {
+            if previous.is_some_and(|difference| difference <= 0.0) && fast > slow {
+                self.target_side = 1;
+            } else if previous.is_some_and(|difference| difference >= 0.0) && fast < slow {
+                self.target_side = -1;
+            }
+        }
+    }
+}
+
+/// Worst-case position exposure from locally known orders. A pending cancellation does
+/// not release capacity: the order may have filled at the exchange while its response
+/// is still in flight. Only a terminal local update releases its remaining quantity.
+struct PositionBudget {
+    position: f64,
+    limit: f64,
+    buys: f64,
+    sells: f64,
+}
+
+impl PositionBudget {
+    fn from_orders<'a>(position: f64, limit: f64, orders: impl IntoIterator<Item = &'a Order>) -> Self {
+        let mut budget = Self { position, limit, buys: 0.0, sells: 0.0 };
+        for order in orders {
+            if order.active() || order.pending() {
+                budget.reserve(order.side, order.leaves_qty.max(0.0));
+            }
+        }
+        budget
+    }
+
+    fn can_submit(&self, side: Side, quantity: f64) -> bool {
+        let worst = match side {
+            Side::Buy => self.position + self.buys + quantity,
+            Side::Sell => -self.position + self.sells + quantity,
+            _ => return false,
+        };
+        quantity.is_finite() && quantity > 0.0 && worst <= self.limit + 1e-9
+    }
+
+    /// Reserve only after submission succeeds. Failed requests add no exposure.
+    fn reserve(&mut self, side: Side, quantity: f64) {
+        match side {
+            Side::Buy => self.buys += quantity,
+            Side::Sell => self.sells += quantity,
+            _ => {}
+        }
+    }
+}
+
+/// IOC reversals must wait until every previous order has a terminal local update.
+fn ema_can_submit<'a>(position: f64, limit: f64, side: Side, quantity: f64, orders: impl IntoIterator<Item = &'a Order>) -> bool {
+    let orders: Vec<&Order> = orders.into_iter().collect();
+    !orders.iter().any(|order| order.active() || order.pending())
+        && PositionBudget::from_orders(position, limit, orders).can_submit(side, quantity)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    validate_args(&args)?;
     let t_start = Instant::now();
 
     // ---- scan the feed data once for counters (progress / events processed) ----
@@ -336,6 +473,17 @@ fn main() -> Result<()> {
     };
 
     let shared: SharedQueue = Rc::new(RefCell::new(HashMap::new()));
+    let (fees, fee_desc) = match args.fee_per_contract {
+        Some(fee) => (
+            Fees::Quantity(TradingQtyFeeModel::new(CommonFees::new(fee, fee))),
+            json!({ "kind": "TradingQtyFeeModel", "maker": fee, "taker": fee,
+                "units": "cash per contract per side" }),
+        ),
+        None => (
+            Fees::Value(TradingValueFeeModel::new(CommonFees::new(args.maker_fee, args.taker_fee))),
+            json!({ "kind": "TradingValueFeeModel", "maker": args.maker_fee, "taker": args.taker_fee }),
+        ),
+    };
     let qm_desc;
     let tick = args.tick_size;
     let lot = args.lot_size;
@@ -353,8 +501,8 @@ fn main() -> Result<()> {
             let asset = L2AssetBuilder::new()
                 .data(args.data.iter().map(|p| DataSource::File(p.to_string_lossy().to_string())).collect())
                 .latency_model(latency.clone())
-                .asset_type(LinearAsset::new(1.0))
-                .fee_model(TradingValueFeeModel::new(CommonFees::new(args.maker_fee, args.taker_fee)))
+                .asset_type(LinearAsset::new(args.contract_size))
+                .fee_model(fees.clone())
                 .exchange(ExchangeKind::NoPartialFillExchange)
                 .last_trades_capacity(50_000)
                 .queue_model(RecordingQueueModel::new($qm, shared.clone()))
@@ -402,9 +550,10 @@ fn main() -> Result<()> {
 
     // ---- strategy parameters ----
     let order_qty = args.order_qty;
+    let ema_strategy = args.strategy == "ema";
     let queue_strategy = match args.strategy.as_str() {
         "queue" => true,
-        "grid" => false,
+        "grid" | "ema" => false,
         other => bail!("unknown strategy {other}"),
     };
     let grid_num = args.grid_num;
@@ -428,6 +577,7 @@ fn main() -> Result<()> {
     let mut meta: HashMap<u64, OrderMeta> = HashMap::new();
     let mut feed = FeedStats::new();
     let mut last_lat: Option<(i64, i64, i64)> = None;
+    let mut ema = EmaStrategy::default();
 
     // Initialise the event set and land on the first event timestamp.
     match hbt.elapse(0)? {
@@ -478,10 +628,38 @@ fn main() -> Result<()> {
                 b.tr_tick.push((tr.px / tick).round() as i32);
                 b.tr_qty.push(tr.qty as f32);
                 b.tr_side.push(if tr.ev & BUY_EVENT == BUY_EVENT { 1 } else if tr.ev & SELL_EVENT == SELL_EVENT { -1 } else { 0 });
+                if ema_strategy {
+                    ema.observe(tr.local_ts, tr.px);
+                }
             }
             hbt.clear_last_trades(Some(0));
+            if ema_strategy {
+                ema.advance(now);
+            }
 
-            if book_ok {
+            if book_ok && ema_strategy {
+                let target = ema.target_side as f64 * order_qty.min(max_position);
+                let delta = target - hbt.position(0);
+                // A reversal may transact two contracts while ending at the one-contract limit.
+                let qty = (delta.abs() / lot).round() * lot;
+                let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
+                if qty >= lot * (1.0 - 1e-8)
+                    && ema_can_submit(hbt.position(0), max_position, side, qty, hbt.orders(0).values())
+                {
+                    let px = if side == Side::Buy { best_ask } else { best_bid };
+                    let id = (1u64 << 50) + n_submits;
+                    let submitted = match side {
+                        Side::Buy => hbt.submit_buy_order(0, id, px, qty, TimeInForce::IOC, OrdType::Limit, false),
+                        _ => hbt.submit_sell_order(0, id, px, qty, TimeInForce::IOC, OrdType::Limit, false),
+                    };
+                    if submitted.is_ok() {
+                        n_submits += 1;
+                        meta.insert(id, OrderMeta { submit_t: now, ack_t: 0, exch_ack_t: 0 });
+                        seen.insert(id, Seen { status: Status::None, req: Status::New, exch_ts: 0 });
+                        push_event(&mut b, rel(now), EV_SUBMIT, id, side, (px / tick).round() as i64, qty, rel(now), f64::NAN, &shared, 0);
+                    }
+                }
+            } else if book_ok {
                 // ---------------- grid market making with inventory skew ----------------
                 // fair price: mid for the grid strategy, book pressure (micro-price) for the queue
                 // strategy, exactly as in the tutorials.
@@ -549,7 +727,11 @@ fn main() -> Result<()> {
                     (Side::Buy, _) => std::cmp::Ordering::Less,
                     _ => std::cmp::Ordering::Greater,
                 });
+                let mut budget = PositionBudget::from_orders(position, max_position, hbt.orders(0).values());
                 for (id, px, side) in to_submit {
+                    if !budget.can_submit(side, order_qty) {
+                        continue;
+                    }
                     let r = match side {
                         Side::Buy => hbt.submit_buy_order(0, id, px, order_qty, TimeInForce::GTX, OrdType::Limit, false),
                         _ => hbt.submit_sell_order(0, id, px, order_qty, TimeInForce::GTX, OrdType::Limit, false),
@@ -557,6 +739,7 @@ fn main() -> Result<()> {
                     if r.is_err() {
                         continue;
                     }
+                    budget.reserve(side, order_qty);
                     n_submits += 1;
                     meta.insert(id, OrderMeta { submit_t: now, ack_t: 0, exch_ack_t: 0 });
                     seen.insert(id, Seen { status: Status::None, req: Status::New, exch_ts: 0 });
@@ -634,6 +817,10 @@ fn main() -> Result<()> {
     }
 
     let t_end = hbt.current_timestamp();
+    let final_state = hbt.state_values(0).clone();
+    let final_depth = hbt.depth(0);
+    let final_mid = (final_depth.best_bid() + final_depth.best_ask()) / 2.0;
+    let final_equity = final_state.balance + final_state.position * final_mid * args.contract_size - final_state.fee;
     let wall = t_start.elapsed();
     hbt.close()?;
 
@@ -659,6 +846,8 @@ fn main() -> Result<()> {
     rec.i32("ask_tick", &b.ask_tick, levels);
     rec.f32("ask_qty", &b.ask_qty, levels);
     rec.f32("position", &b.position, 1);
+    rec.f64("balance", &b.balance, 1);
+    rec.f64("fee", &b.fee, 1);
     rec.i32("num_trades", &b.num_trades, 1);
     rec.f32("volume", &b.volume, 1);
     rec.f32("feed_lat_last", &b.feed_lat_last, 1);
@@ -705,8 +894,10 @@ fn main() -> Result<()> {
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "symbol": args.symbol,
         "exchange": args.exchange,
+        "source_note": args.source_note,
         "tick_size": tick,
         "lot_size": lot,
+        "contract_size": args.contract_size,
         "t0_ns": t0.to_string(),
         "t0_iso": fmt_ts(t0),
         "t_end_ns": t_end.to_string(),
@@ -730,13 +921,15 @@ fn main() -> Result<()> {
             "latency": latency_desc,
             "queue": qm_desc,
             "exchange": "NoPartialFillExchange",
-            "fee": { "kind": "TradingValueFeeModel", "maker": args.maker_fee, "taker": args.taker_fee },
-            "asset": { "kind": "LinearAsset", "contract_size": 1.0 },
+            "fee": fee_desc,
+            "asset": { "kind": "LinearAsset", "contract_size": args.contract_size },
             "depth": "HashMapMarketDepth",
         },
         "strategy": {
             "kind": args.strategy,
-            "name": if queue_strategy {
+            "name": if ema_strategy {
+                "9/21 EMA crossover on completed one-minute trade bars"
+            } else if queue_strategy {
                 "queue-based market making: book-pressure fair price, inventory skew (hftbacktest tutorial)"
             } else {
                 "grid market making with inventory skew (hftbacktest tutorial)"
@@ -748,9 +941,14 @@ fn main() -> Result<()> {
             "skew_ticks": skew / tick,
             "fair_price": if queue_strategy { "book pressure (best_bid*ask_qty + best_ask*bid_qty)/(bid_qty+ask_qty)" } else { "mid" },
             "max_position": max_position,
-            "time_in_force": "GTX",
+            "time_in_force": if ema_strategy { "IOC" } else { "GTX" },
             "order_type": "LIMIT",
             "decision_interval_ms": args.frame_ms,
+            "ema_fast": if ema_strategy { Some(9) } else { None },
+            "ema_slow": if ema_strategy { Some(21) } else { None },
+            "bar_seconds": if ema_strategy { Some(60) } else { None },
+            "bar_clock": if ema_strategy { Some("local trade arrival timestamps; completed nonempty bars only") } else { None },
+            "execution": if ema_strategy { "marketable limit at current opposite best; IOC, subject to configured latency" } else { "post-only limit orders" },
         },
         "run": {
             "wall_ms": wall.as_millis() as u64,
@@ -765,6 +963,12 @@ fn main() -> Result<()> {
             "fills": fills,
             "order_events": b.e_kind.len(),
             "market_trades": b.tr_tick.len(),
+            "final_position": final_state.position,
+            "balance": final_state.balance,
+            "fees": final_state.fee,
+            "equity": if final_equity.is_finite() { Some(final_equity) } else { None },
+            "mark_price": if final_mid.is_finite() { Some(final_mid) } else { None },
+            "completed_strategy_bars": if ema_strategy { Some(ema.completed) } else { None },
         },
         "engine": {
             "name": "hftbacktest",
@@ -844,6 +1048,8 @@ fn record_frame(
 
     let sv = hbt.state_values(0);
     b.position.push(sv.position as f32);
+    b.balance.push(sv.balance);
+    b.fee.push(sv.fee);
     b.num_trades.push(sv.num_trades as i32);
     b.volume.push(sv.trading_volume as f32);
 
@@ -938,6 +1144,168 @@ fn fmt_ts(ns: i64) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
+fn validate_args(args: &Args) -> Result<()> {
+    for (name, value) in [
+        ("tick-size", args.tick_size),
+        ("lot-size", args.lot_size),
+        ("contract-size", args.contract_size),
+        ("order-qty", args.order_qty),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            bail!("--{name} must be finite and greater than zero");
+        }
+    }
+    if args.frame_ms <= 0 || args.frame_ms > i64::MAX / 1_000_000 {
+        bail!("--frame-ms must be positive and fit in nanoseconds");
+    }
+    if args.grid_num == 0 || args.levels == 0 {
+        bail!("--grid-num and --levels must be greater than zero");
+    }
+    if args.max_position.is_some_and(|value| !value.is_finite() || value < args.order_qty) {
+        bail!("--max-position must be finite and at least --order-qty");
+    }
+    if args.fee_per_contract.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        bail!("--fee-per-contract must be finite and nonnegative");
+    }
+    if !args.maker_fee.is_finite() || !args.taker_fee.is_finite() {
+        bail!("--maker-fee and --taker-fee must be finite");
+    }
+    let lots = args.order_qty / args.lot_size;
+    if (lots - lots.round()).abs() > 1e-8 {
+        bail!("--order-qty must be a whole multiple of --lot-size");
+    }
+    if !args.max_minutes.is_finite() || args.max_minutes < 0.0 {
+        bail!("--max-minutes must be finite and nonnegative");
+    }
+    if let Some(latencies) = &args.const_latency_us {
+        if latencies.len() != 2 {
+            bail!("--const-latency-us requires two values: entry,response");
+        }
+        if latencies.iter().any(|&value| value < 0 || value > i64::MAX / 1000) {
+            bail!("constant order latencies must be nonnegative and fit in nanoseconds");
+        }
+    }
+    Ok(())
+}
+
 fn rustc_version() -> String {
     option_env!("HFTENGINE_RUSTC").unwrap_or("unknown").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hftbacktest::backtest::assettype::AssetType;
+
+    #[test]
+    fn mnq_round_trip_uses_dollars_per_point_and_per_side_commissions() {
+        let asset = LinearAsset::new(2.0);
+        let fees = Fees::Quantity(TradingQtyFeeModel::new(CommonFees::new(0.75, 0.75)));
+        let mut buy = Order::new(1, 80_000, 0.25, 1.0, Side::Buy, OrdType::Limit, TimeInForce::IOC);
+        buy.exec_qty = 1.0;
+        let mut sell = buy.clone();
+        sell.side = Side::Sell;
+        sell.maker = true;
+        let balance = -asset.amount(20_000.0, 1.0) + asset.amount(20_005.0, 1.0);
+        let commissions = fees.amount(&buy, 40_000.0) + fees.amount(&sell, 40_010.0);
+        assert_eq!(commissions, 1.5);
+        assert_eq!(asset.equity(20_005.0, balance, 0.0, commissions), 8.5);
+    }
+
+    #[test]
+    fn cryptocurrency_fee_defaults_stay_percentage_based() {
+        let fees = Fees::Value(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)));
+        let mut order = Order::new(1, 1, 0.1, 1.0, Side::Buy, OrdType::Limit, TimeInForce::GTX);
+        order.exec_qty = 1.0;
+        order.maker = true;
+        assert!((fees.amount(&order, 1000.0) + 0.05).abs() < 1e-10);
+        order.maker = false;
+        assert!((fees.amount(&order, 1000.0) - 0.7).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ema_waits_for_completed_bars_and_warmup_before_a_crossover() {
+        let mut strategy = EmaStrategy::default();
+        for minute in 0..21 {
+            strategy.observe(minute * EmaStrategy::MINUTE_NS, 100.0);
+            strategy.advance((minute + 1) * EmaStrategy::MINUTE_NS);
+        }
+        assert_eq!(strategy.completed, 21);
+        assert_eq!(strategy.target_side, 0);
+        strategy.observe(21 * EmaStrategy::MINUTE_NS, 110.0);
+        strategy.advance(22 * EmaStrategy::MINUTE_NS - 1);
+        assert_eq!(strategy.target_side, 0, "the current minute must not affect the signal");
+        strategy.advance(22 * EmaStrategy::MINUTE_NS);
+        assert_eq!(strategy.target_side, 1);
+        strategy.observe(20 * EmaStrategy::MINUTE_NS, 1.0);
+        assert_eq!(strategy.target_side, 1, "late data must not revise a completed signal");
+    }
+    fn test_order(side: Side, status: Status, req: Status, leaves: f64) -> Order {
+        let mut order = Order::new(1, 100, 0.25, 1.0, side, OrdType::Limit, TimeInForce::GTX);
+        order.status = status;
+        order.req = req;
+        order.leaves_qty = leaves;
+        order
+    }
+
+    #[test]
+    fn position_budget_reserves_canceling_orders_and_in_flight_fills_symmetrically() {
+        for side in [Side::Buy, Side::Sell] {
+            // Reproduce the old overshoot: old fill is in flight, local position is
+            // still flat and cancellation has just been requested for the old quote.
+            let old = test_order(side, Status::New, Status::Canceled, 1.0);
+            let budget = PositionBudget::from_orders(0.0, 1.0, [&old]);
+            assert!(!budget.can_submit(side, 1.0), "replacement must wait for terminal update");
+            // A fill response moves position and clears remaining order exposure.
+            let filled = test_order(side, Status::Filled, Status::None, 0.0);
+            let position = if side == Side::Buy { 1.0 } else { -1.0 };
+            let budget = PositionBudget::from_orders(position, 1.0, [&filled]);
+            assert!(!budget.can_submit(side, 1.0));
+            let opposite = if side == Side::Buy { Side::Sell } else { Side::Buy };
+            assert!(budget.can_submit(opposite, 2.0), "bounded reversal remains allowed");
+            // A confirmed cancellation, unlike a request, releases its quantity.
+            let canceled = test_order(side, Status::Canceled, Status::None, 1.0);
+            assert!(PositionBudget::from_orders(0.0, 1.0, [&canceled]).can_submit(side, 1.0));
+        }
+    }
+
+    #[test]
+    fn position_budget_reserves_pending_new_orders_and_same_frame_submissions() {
+        let pending = test_order(Side::Buy, Status::None, Status::New, 1.0);
+        let mut budget = PositionBudget::from_orders(0.0, 2.0, [&pending]);
+        assert!(budget.can_submit(Side::Buy, 1.0));
+        // A failed submission leaves this budget unchanged: reserve is not called.
+        assert!(budget.can_submit(Side::Buy, 1.0));
+        budget.reserve(Side::Buy, 1.0);
+        assert!(!budget.can_submit(Side::Buy, 1.0));
+        assert!(budget.can_submit(Side::Sell, 2.0), "opposite fills do not net away worst-case buy exposure");
+    }
+
+    #[test]
+    fn position_budget_uses_remaining_partial_quantity_and_rejects_invalid_size() {
+        let partial = test_order(Side::Sell, Status::PartiallyFilled, Status::None, 0.5);
+        let budget = PositionBudget::from_orders(-0.5, 1.0, [&partial]);
+        assert!(!budget.can_submit(Side::Sell, 0.25));
+        assert!(budget.can_submit(Side::Buy, 1.5));
+        assert!(!budget.can_submit(Side::Buy, 1.75));
+        assert!(!budget.can_submit(Side::Buy, f64::NAN));
+        assert!(!budget.can_submit(Side::Buy, 0.0));
+    }
+
+    #[test]
+    fn ema_waits_for_ioc_responses_and_limits_reversals_symmetrically() {
+        for side in [Side::Buy, Side::Sell] {
+            let opposite = if side == Side::Buy { Side::Sell } else { Side::Buy };
+            let mut pending = test_order(opposite, Status::None, Status::New, 1.0);
+            pending.time_in_force = TimeInForce::IOC;
+            assert!(!ema_can_submit(0.0, 1.0, side, 1.0, [&pending]));
+            let working = test_order(opposite, Status::New, Status::None, 1.0);
+            assert!(!ema_can_submit(0.0, 1.0, side, 1.0, [&working]));
+            let filled = test_order(opposite, Status::Filled, Status::None, 0.0);
+            let position = if side == Side::Buy { -1.0 } else { 1.0 };
+            assert!(ema_can_submit(position, 1.0, side, 2.0, [&filled]));
+            assert!(!ema_can_submit(position, 1.0, side, 3.0, [&filled]));
+        }
+    }
+
 }

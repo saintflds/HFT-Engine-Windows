@@ -37,3 +37,10 @@ jobs:
         run: npm run build
       - name: Parse Python tooling
         run: python -c "import ast, pathlib; [ast.parse(p.read_bytes(), filename=str(p)) for p in pathlib.Path('tools').rglob('*.py')]"
+      - name: Run synthetic dashboard and paper-execution tests
+        working-directory: dashboard
+        env:
+          SIERRA_DATA_FOLDER: ${{ runner.temp }}/empty-sierra-data
+        run: npm run test:mnq
+      - name: Run synthetic Sierra file-format tests
+        run: python -m unittest discover -s tools/sierra -p test_session.py

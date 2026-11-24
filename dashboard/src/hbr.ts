@@ -34,16 +34,33 @@ const CTORS = {
 } as const;
 
 export function parseHbr(buf: ArrayBuffer): Hbr {
+  if (buf.byteLength < 12) throw new Error("Incomplete replay file: missing header.");
   const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 8));
   if (magic !== "HFTREC01") throw new Error(`not an hbr file (magic ${magic})`);
   const hlen = new DataView(buf).getUint32(8, true);
+  if (hlen > buf.byteLength - 12) throw new Error("Incomplete replay file: truncated header.");
   const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, hlen)));
+  if (!header || !header.meta || typeof header.meta !== 'object' || !Array.isArray(header.arrays)) {
+    throw new Error("Invalid replay file: missing metadata or arrays.");
+  }
   let start = 12 + hlen;
   start += (8 - (start % 8)) % 8;
   const arrays = new Map<string, { data: TypedArray; shape: number[] }>();
   for (const a of header.arrays as ArrayDesc[]) {
+    if (!a || typeof a.name !== 'string' || !Object.hasOwn(CTORS, a.dtype) || arrays.has(a.name)) {
+      throw new Error("Invalid replay file: unknown or duplicate array.");
+    }
     const C = CTORS[a.dtype];
+    if (!Number.isSafeInteger(a.offset) || a.offset < 0 || !Number.isSafeInteger(a.length) || a.length < 0
+      || a.length % C.BYTES_PER_ELEMENT || (start + a.offset) % C.BYTES_PER_ELEMENT
+      || a.offset > buf.byteLength - start || a.length > buf.byteLength - start - a.offset) {
+      throw new Error(`Incomplete or invalid replay array: ${a.name}.`);
+    }
     const n = a.length / C.BYTES_PER_ELEMENT;
+    if (!Array.isArray(a.shape) || !a.shape.every(v => Number.isSafeInteger(v) && v >= 0)
+      || a.shape.reduce((total, v) => total * v, 1) !== n) {
+      throw new Error(`Invalid replay array shape: ${a.name}.`);
+    }
     const abs = start + a.offset;
     // arrays are 8-byte aligned in the file, so a view without copying is valid
     const data = new C(buf, abs, n) as TypedArray;

@@ -1,3 +1,4 @@
+import {sierraPanel} from '../sierra-panels';
 /** QUEUE: every live order with the exchange-side queue estimate (ahead / level), position in
  * the queue, time resting, and a bar ahead|ours|behind. */
 import { CW, esc, sp } from "../dom";
@@ -8,6 +9,10 @@ import { Panel, type RenderCtx } from "./base";
 const num = (v: number) => (Number.isFinite(v) ? v.toFixed(3) : "-");
 
 export class QueuePanel extends Panel {
+  override updateSession(session: Session): void {
+    super.updateSession(session);
+    this.statsN = -1;
+  }
   private readonly pxd: number;
   private readonly qd: number;
 
@@ -19,12 +24,18 @@ export class QueuePanel extends Panel {
 
   render(c: RenderCtx): void {
     const s = this.s;
+    const account=sierraPanel(s,'queue');if(account){this.body.innerHTML=account.html;this.setTitle(account.title);return;}
     const f = c.f;
     const key = `${f}|${this.rows}|${this.cols}|${Math.floor(c.t / 1e8)}`;
     if (!this.changed(key)) return;
     const [o0, o1] = s.orderRange(f);
     const cols = this.cols;
     const rows = this.rows;
+
+    if (cols < 60) {
+      this.renderCompact(c, o0, o1);
+      return;
+    }
 
     const wide = cols >= 72;
     const head = sp("d", lj("SIDE", 4) + " " + rj("PRICE", 9) + " " + rj("QTY", 6) + " " + rj("AHEAD", 7) + (wide ? " " + rj("LEVEL", 7) : "") + " " + rj("POS", 4) + " " + rj("HITS", 4) + " " + rj("REST", 6) + " " + lj("ST", 4) + " QUEUE ahead|ours|behind");
@@ -85,7 +96,7 @@ export class QueuePanel extends Panel {
         bar;
       out.push(line);
     }
-    if (o1 === o0) out.push(sp("d", "no working orders"));
+    if (o1 === o0) out.push(sp("d", `${this.s.meta.live?.sim.status==='off'?'Engine orders OFF — enable Orders above':this.s.meta.live?.sim.decision??'no working orders'}`));
 
     // session-so-far statistics from the recorded order events
     if (rows - out.length >= 5) {
@@ -122,6 +133,41 @@ export class QueuePanel extends Panel {
 
   private statsN = -1;
   private statsCache = { submitted: 0, accepted: 0, filled: 0, canceled: 0, rejected: 0, aheadP50: NaN, aheadP90: NaN, emptyPct: 0, restP50: NaN, restP90: NaN, tradedP50: NaN, touchedPct: 0 };
+
+  private renderCompact(c: RenderCtx, o0: number, o1: number): void {
+    const s = this.s;
+    const out = [sp('d', 'SIDE    PRICE QTY AHEAD POS')];
+    let resting = 0;
+    for (let i = o0; i < o1; i++) if (s.oStatus[i] !== ST.NONE) resting++;
+    const showBars = (o1 - o0) * 2 + 2 <= this.rows;
+    for (let i = o0; i < o1 && out.length < this.rows; i++) {
+      const pending = s.oStatus[i] === ST.NONE;
+      const canceling = s.oReq[i] === 4;
+      const ahead = Math.max(0, s.oFront[i]);
+      const level = s.oLevel[i];
+      const qty = s.oLeaves[i];
+      const known = Number.isFinite(ahead) && Number.isFinite(level);
+      const position = known ? ahead < s.lotSize / 2 ? '1st' : `${Math.round(Math.min(1, ahead / Math.max(level, 1)) * 100)}%` : '?';
+      const side = s.oSide[i] === 1 ? 'BUY ' : 'SELL';
+      out.push(sp(pending || canceling ? 'd' : s.oSide[i] === 1 ? 'bid' : 'ask', side) + ' '
+        + sp('ours', rj((s.oTick[i] * s.tickSize).toFixed(this.pxd), 8)) + ' '
+        + sp('w', rj(qty.toFixed(this.qd), 3)) + ' ' + sp('c', rj(known ? ahead.toFixed(this.qd) : '?', 5)) + ' ' + sp('y', rj(position, 3)));
+      const width = Math.max(4, this.cols - 6) * CW;
+      const total = Math.max(level, ahead + qty, 1);
+      const frontW = Math.round(ahead / total * width);
+      const oursW = Math.max(2, Math.round(qty / total * width));
+      if (showBars) out.push(sp('d', pending ? 'PEND ' : canceling ? 'CXL  ' : 'NEW  ')
+        + `<span class="qbar" style="width:${width}px"><i class="ahead" style="left:0;width:${frontW}px"></i><i class="ours" style="left:${frontW}px;width:${oursW}px"></i></span>`);
+    }
+    if (o0 === o1) out.push(sp('d', this.s.meta.live?.sim.status==='off'?'Engine orders OFF — enable Orders above':this.s.meta.live?.sim.decision??'no working orders'));
+    const stats = this.stats(s.eventsUpTo(c.t));
+    out.push('', sp('d', `SESSION ${stats.submitted} new / ${stats.accepted} ack`),
+      sp('y', `${stats.filled} fills`) + sp('d', ` / ${stats.canceled} canceled`),
+      sp('d', 'ahead p50 ') + sp('c', num(stats.aheadP50)),
+      sp('d', 'rested p50 ') + sp('w', dur(stats.restP50)));
+    this.body.innerHTML = out.slice(0, this.rows).join('\n');
+    this.setTitle(`${resting} resting / ${o1 - o0} working │ ${s.meta.models.queue.kind}`);
+  }
 
   private stats(evN: number) {
     if (evN === this.statsN) return this.statsCache;

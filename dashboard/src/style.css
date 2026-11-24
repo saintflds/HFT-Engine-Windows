@@ -1,4 +1,4 @@
-/* HFTENGINE dashboard — text-mode terminal look: IBM VGA 9x16 bitmap font on a blue field,
+/* HFTENGINE dashboard — text-mode terminal look: IBM VGA 9x16 bitmap font on a black field,
    CGA/EGA 16-colour palette, 1-character grid. Everything is sized in character cells
    (--cw x --ch) so the layout stays crisp at integer zoom levels. */
 
@@ -36,8 +36,8 @@
   --magenta-dark: #aa00aa;
   --black: #000000;
 
-  --bg: var(--blue);
-  --bg-app: var(--blue-deep);
+  --bg: var(--black);
+  --bg-app: var(--black);
   --fg: var(--gray);
   --fg-dim: #7878d8;
   --fg-hi: var(--white);
@@ -85,6 +85,12 @@ body {
 #app.zoom-1 { zoom: 1; }
 #app.zoom-2 { zoom: 2; }
 #app.zoom-3 { zoom: 3; }
+/* Fixed inset sizing otherwise scales the full viewport again at integer zoom,
+   putting the right-hand panels outside the window on large displays. */
+#app.zoom-2:not(.framed),
+#app.zoom-3:not(.framed) { inset: auto; top: 0; left: 0; }
+#app.zoom-2:not(.framed) { width: 50vw; height: 50vh; }
+#app.zoom-3:not(.framed) { width: calc(100vw / 3); height: calc(100vh / 3); }
 
 /* frame=WxH: a fixed-size app box (device px) centred in the window, for screen recording */
 #app.framed {
@@ -116,6 +122,90 @@ body:has(#app.framed) {
 .bar.status .v { color: var(--white); }
 .bar.status .play { color: var(--green); }
 .bar.status .pause { color: var(--yellow); }
+.mode-nav a { color: var(--title-fg); text-decoration: underline; }
+.mode-nav a[aria-current="page"] { color: var(--white); background: var(--blue-deep); }
+.mode-nav a:focus-visible { outline: 1px solid var(--title-key); }
+.original-live.feed-stale .ladder .bar { opacity: 0.4; }
+.live-dashboard.feed-stale .ladder .bar { opacity: 0.4; }
+.paper-inline-control {
+  border: 0;
+  border-radius: 0;
+  padding: 0 var(--cw);
+  font: inherit;
+  line-height: var(--ch);
+  background: var(--gray);
+  color: var(--blue-deep);
+  cursor: pointer;
+}
+.paper-inline-control[aria-pressed="true"] { background: var(--yellow); }
+.paper-inline-control:focus-visible { outline: 1px solid var(--white); }
+.original-live .panel > .body { overflow: auto; scrollbar-width: thin; }
+#app.original-live { container: original-live / inline-size; }
+.paper-sim-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 var(--cw);
+  height: auto;
+  min-height: var(--ch);
+  background: var(--blue-dark);
+  color: var(--gray);
+}
+.paper-sim-controls button {
+  background: var(--gray);
+  color: var(--blue-deep);
+  border: 0;
+  border-radius: 0;
+  padding: 0 var(--cw);
+  font: inherit;
+  line-height: var(--ch);
+  cursor: pointer;
+}
+.paper-sim-controls button[aria-pressed="true"] { background: var(--yellow); }
+.paper-sim-controls button:focus-visible { outline: 1px solid var(--white); outline-offset: 1px; }
+
+/* Use the space inside integer zoom, including a narrow Codex side panel. */
+@container original-live (max-width: 1100px) {
+  .original-live > .bar {
+    height: auto;
+    min-height: var(--ch);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .original-live .work.landscape {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: 400px 208px 160px 192px 144px;
+    grid-template-areas:
+      "book tape"
+      "market collector"
+      "queue latency"
+      "fills engine"
+      "log log";
+    overflow: auto;
+    align-content: start;
+  }
+  .original-live .panel > .body:not(.ladder) {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+@container original-live (max-width: 760px) {
+  .original-live .work.landscape {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 400px 208px 208px 192px 144px 144px 144px 192px 144px;
+    grid-template-areas:
+      "book"
+      "market"
+      "tape"
+      "collector"
+      "queue"
+      "latency"
+      "fills"
+      "engine"
+      "log";
+  }
+}
 
 /* ---------- workspace ---------- */
 .safe {
@@ -132,11 +222,12 @@ body:has(#app.framed) {
 }
 .work.landscape {
   grid-template-columns: 50ch 1fr 1fr 1fr;
-  grid-template-rows: 1fr 1fr 1fr;
+  grid-template-rows: 1fr 1fr 1fr minmax(110px, 16vh);
   grid-template-areas:
     "book queue latency engine"
     "book fills market collector"
-    "book tape log log";
+    "book tape log log"
+    "week week week week";
 }
 .work.portrait {
   grid-template-columns: 1fr;
@@ -263,4 +354,104 @@ canvas {
   background: var(--bg-app);
   color: var(--gray);
   white-space: pre;
+}
+.sierra-history-content { overflow:auto; flex:1; padding:24px; line-height:1.6; }
+.sierra-history-content pre { white-space:pre-wrap; }
+.sierra-controls { display:flex; flex-wrap:wrap; gap:18px; margin:24px 0; align-items:end; }
+.sierra-controls label { display:flex; flex-direction:column; gap:6px; }
+.sierra-controls input,.sierra-controls select,.sierra-controls button { background:var(--blue-dark); color:var(--white); border:1px solid var(--gray); padding:8px; font:inherit; }
+.sierra-controls input { width:150px; }
+.sierra-controls button { cursor:pointer; color:var(--yellow); }
+.sierra-controls button:disabled { opacity:.45; cursor:default; }
+.sierra-open-session { display:block; margin:24px 0; color:var(--yellow); }
+[hidden] { display:none !important; }
+.sierra-job-log { max-height:260px; overflow:auto; color:var(--yellow); }
+.sierra-history-content a { color:var(--cyan); }
+
+.chart-toggle { height:16px; padding:0 6px; border:0; background:var(--blue-dark); color:var(--cyan); font:11px Consolas,monospace; cursor:pointer; }
+.live-strategy-control select { background:var(--blue-dark); color:var(--yellow); border:1px solid var(--gray-dark); font:inherit; }
+.live-dashboard > .mode-nav { height:auto; min-height:var(--ch); white-space:normal; }
+.live-dashboard > .mode-nav a, .live-strategy-control { display:inline-block; white-space:nowrap; }
+.live-dashboard [data-panel="engine"] > .body { overflow-y:auto; scrollbar-width:thin; }
+.market-body { position:relative; background:var(--black); }
+.market-tools { height:24px; display:flex; align-items:center; gap:5px; padding:0 6px; background:var(--blue-dark); box-sizing:border-box; }
+.market-tools button,.market-tools select { font:16px VGA,monospace; line-height:18px; padding:0 4px; border:1px solid var(--blue-light); color:var(--white); background:var(--blue-dark); cursor:pointer; }
+.market-tools button[aria-pressed=true] { color:var(--cyan); border-color:var(--cyan-dark); }
+.market-tools .market-expand { margin-left:auto; }
+.market-tooltip { position:absolute; left:6px; bottom:6px; z-index:5; max-width:calc(100% - 24px); max-height:65%; overflow:auto; padding:8px; border:1px solid var(--cyan); background:var(--blue-dark); color:var(--white); font:16px VGA,monospace; line-height:18px; white-space:pre-wrap; pointer-events:none; box-shadow:0 3px 12px #0008; }
+
+/* Original grey window chrome; chart surfaces retain the blue theme. */
+
+.sierra-account { flex: 0 0 auto; border: 2px solid var(--frame); background: var(--black); color: var(--white); margin: 2px 4px; }
+.sierra-account > summary { cursor: pointer; padding: 2px 6px; background: var(--title-bg); color: var(--title-fg); }
+.sierra-account-metrics { padding: 3px 6px; white-space: pre-wrap; }
+.sierra-account-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 0 6px 4px; }
+.sierra-account-columns > div { min-width: 0; max-height: 112px; overflow: auto; }
+.sierra-account table { font: inherit; line-height: 16px; width: 100%; border-collapse: collapse; white-space: nowrap; }
+.sierra-account th { color: var(--cyan); text-align: left; font-weight: normal; position: sticky; top: 0; background: var(--blue-dark); }
+.sierra-account td,.sierra-account th { padding: 0 10px 0 0; }
+.sierra-account td:last-child,.sierra-account th:last-child { padding-right: 0; }
+@media (max-width: 850px) { .sierra-account-columns { grid-template-columns: 1fr; gap: 4px; } .sierra-account-columns > div { max-height: 64px; } }
+
+.paper-inline-control { background:var(--blue-dark); color:var(--white); }
+.paper-inline-control[aria-pressed="true"] { color:var(--blue-deep); }
+
+.panel.active > .title .right { color:var(--blue-deep); }
+
+/* Live lower row: half-width tape, compact log, weekly chart below Collector. */
+.live-dashboard .work.landscape {grid-template-columns:50ch repeat(6,minmax(0,1fr));grid-template-areas:"book queue queue latency latency engine engine" "book fills fills market market collector collector" "book tape log log week week week";}
+.week-body {display:flex;flex-direction:column;overflow:hidden!important;padding:2px!important;}
+.week-controls {display:flex;flex-wrap:wrap;gap:3px;flex:none;}
+.week-note {font:11px monospace;color:#ccc;flex:none;white-space:normal;}
+.week-canvas {min-height:0;touch-action:none;cursor:grab;}
+.week-floating {position:fixed!important;z-index:1000;width:min(850px,85vw);height:450px;resize:both;overflow:hidden;min-width:320px;min-height:220px;max-width:95vw;max-height:90vh;box-shadow:0 5px 30px #0009;}
+.week-floating>.title {cursor:move;touch-action:none;}
+
+/* Floating panels are mounted on body, outside the app's CSS zoom. */
+.week-floating {zoom:1!important;font:16px VGA,monospace;min-width:min(320px,calc(100vw - 16px));min-height:min(220px,calc(100vh - 16px));max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);}
+.week-placeholder {min-width:0;min-height:0;}
+
+/* Daily results: a pixel calendar in the original terminal window chrome. */
+.performance-days {flex:0 0 142px;margin:0 var(--cw) calc(var(--ch)/2);grid-area:auto!important;}
+.performance-body {display:flex;flex-direction:column;gap:3px;padding:3px 7px!important;white-space:normal!important;overflow:hidden!important;}
+.performance-controls {display:flex;align-items:center;gap:6px;flex:0 0 18px;min-width:0;white-space:nowrap;}
+.performance-control {font:inherit;line-height:16px;height:18px;box-sizing:border-box;padding:0 5px;border:1px solid #555555;border-radius:0;color:#ffffff;background:#000050;cursor:pointer;}
+.performance-control:focus-visible {outline:1px solid #55ffff;outline-offset:1px;}
+.performance-source {max-width:220px;min-width:0;}
+.performance-run {max-width:210px;min-width:0;}
+.performance-year {display:flex;align-items:center;gap:5px;margin-left:auto;flex-shrink:0;color:#55ffff;}
+.performance-year-value {width:4ch;text-align:center;}
+.performance-context {min-width:0;overflow:hidden;text-overflow:ellipsis;color:#aaaaaa;white-space:nowrap;}
+.performance-calendar {display:flex;gap:4px;flex:1 1 auto;min-height:28px;}
+.performance-weekdays {padding-top:12px;display:grid;grid-template-rows:repeat(7,minmax(0,1fr));flex:0 0 10px;font:8px EGA8,monospace;color:#777777;}
+.performance-plot {display:flex;flex-direction:column;flex:1;min-width:0;gap:2px;}
+.performance-months {display:grid;grid-template-rows:10px;flex:none;min-width:0;overflow:hidden;font:8px EGA8,monospace;color:#aaa;}
+.performance-grid {display:grid;grid-template-rows:repeat(7,minmax(0,1fr));grid-auto-flow:column;gap:2px;flex:1;min-height:0;}
+.performance-cell {position:relative;display:block;min-width:0;min-height:0;width:100%;height:100%;padding:0;border:1px solid #22252b;border-radius:0;cursor:crosshair;background:#111318;}
+.performance-cell.is-profit,.performance-swatch.is-profit {background:#00aa00;border-color:#00aa00;box-shadow:inset 1px 1px #55ff55,inset -1px -1px #006600;}
+.performance-cell.is-loss,.performance-swatch.is-loss {background:#aa0000;border-color:#aa0000;box-shadow:inset 1px 1px #ff5555,inset -1px -1px #660000;}
+.performance-cell.is-flat,.performance-swatch.is-flat {background:#aaaa00;border-color:#aaaa00;box-shadow:inset 1px 1px #ffff55;}
+.performance-cell:hover,.performance-cell:focus-visible,.performance-cell.is-selected {outline:1px solid #ffffff;outline-offset:1px;z-index:1;}
+.performance-cell.is-partial:after {content:'';position:absolute;right:0;bottom:0;width:2px;height:2px;background:#ffff55;}
+.performance-footer {display:flex;justify-content:space-between;gap:8px;flex:none;height:16px;white-space:nowrap;color:#aaaaaa;overflow:hidden;}
+.performance-legend {display:flex;gap:10px;}
+.performance-legend>span {display:inline-flex;align-items:center;gap:4px;}
+.performance-swatch {display:inline-block;width:8px;height:8px;border:1px solid #34383f;box-sizing:border-box;background:#111318;}
+.performance-unit {color:#777777;}
+.performance-detail {flex:0 0 16px;height:16px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#55ffff;}
+.performance-stats {padding-left:8px;}
+.performance-stats.g {color:#005500!important;}
+.performance-stats.r {color:#880000!important;}
+.has-performance .work.landscape {grid-template-rows:repeat(3,minmax(54px,1fr)) minmax(96px,12vh);overflow:auto;}
+.has-performance.live-dashboard .work.landscape {grid-template-rows:repeat(3,minmax(54px,1fr));}
+.has-performance .sierra-history-content {min-height:0;}
+@media(max-width:900px) {
+ .performance-context {display:none;}
+ .performance-source {max-width:40%;}
+ .performance-run {max-width:32%;}
+ .performance-controls {gap:3px;}
+ .performance-unit {font-size:12px;}
+}
+@media(max-height:650px) {
+ .performance-days {flex-basis:128px;}
 }

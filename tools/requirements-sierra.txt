@@ -1,0 +1,4 @@
+# Sierra conversion/tests use Python's standard library.
+# NumPy is required only for tools/hbr.py and inspecting .npz outputs.
+# Tested on Windows x64 with CPython 3.15.1.
+numpy==2.5.4

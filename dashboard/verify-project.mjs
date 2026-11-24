@@ -1,0 +1,2 @@
+import path from 'node:path';
+export async function assertTestingServer(base,expectedRoot){const r=await fetch(new URL('/api/project-location',base),{signal:AbortSignal.timeout(3000)});if(!r.ok)throw Error('Cannot verify test server project root');const d=await r.json();if(typeof d.root!=='string'||path.resolve(d.root).toLowerCase()!==path.resolve(expectedRoot).toLowerCase())throw Error('Refusing verification against another project: '+String(d.root));}

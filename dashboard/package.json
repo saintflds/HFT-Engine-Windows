@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "test:mnq": "node --test tests/mnq.test.mjs tests/original-live-tape.test.mjs tests/replay-simulation.test.mjs tests/live-session.test.mjs tests/stability.test.mjs tests/adaptive-engine.test.mjs tests/deep-learning.test.mjs tests/deep-integration.test.mjs tests/live-stream.test.mjs tests/sessions.test.mjs tests/terminal-replay.test.mjs tests/busy-tape.test.mjs tests/execution-races-20261107.test.mjs tests/week-alignment-20261108.test.mjs tests/journal-recovery-20261108.test.mjs tests/independent-fixes-20261108.test.mjs tests/performance-data.test.mjs tests/daily-performance.test.mjs tests/kill-switch.test.mjs",
     "dev": "vite --host 127.0.0.1 --port 5180",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --port 5180"

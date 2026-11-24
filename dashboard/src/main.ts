@@ -4,7 +4,7 @@
  *   session=<name>      public/sessions/<name>.hbr (+ <name>.collector.json)     default: sample
  *   layout=landscape|portrait                                                      default: landscape
  *   panels=book,queue   panels shown in portrait layout (top to bottom)            default: book,queue
- *   panel=<key>         focus a single panel (book queue latency fills market tape log engine collector)
+ *   panel=<key>         focus a single panel (book queue latency fills market tape log engine collector week)
  *   zoom=1|2|3          integer zoom (bitmap font stays crisp)                     default: auto
  *   safe=0.16           fraction of the height left empty at top and bottom in portrait
  *   t=<seconds>         start time into the session                               default: 0
@@ -15,6 +15,7 @@
  * Keys: SPACE play/pause, Left/Right seek 5 s, Shift+Left/Right seek 30 s, Up/Down speed,
  *       1-9 focus a panel, 0 all panels, L toggle layout, H toggle key bar, R restart
  */
+import { PerformanceGrid } from "./performance-grid";
 import { ReplayClock } from "./clock";
 import { el, sp } from "./dom";
 import { clock, dateOf, elapsed } from "./fmt";
@@ -29,13 +30,26 @@ import { LogPanel } from "./panels/log";
 import { MarketPanel } from "./panels/market";
 import { QueuePanel } from "./panels/queue";
 import { TapePanel } from "./panels/tape";
-import { Session, type CollectorFacts } from "./session";
+import { WeekPanel } from "./panels/week";
+import { Session, type CollectorFacts, type SierraFacts } from "./session";
+import { addModeNavigation, startOriginalLive } from "./original-live";
+import { startSierraHistory } from "./sierra-history";
 
 const q = new URLSearchParams(location.search);
 let sessionName = q.get("session") ?? "";
 
 async function main(): Promise<void> {
   const app = document.getElementById("app")!;
+  document.title = q.get('live') === 'mnq' ? `HFTENGINE — Live MNQ${q.get('account') === 'sierra' ? ' – Sierra Engine' : ''}`
+    : q.get('sierra') === 'mnq' ? 'HFTENGINE — Backtest' : 'HFTENGINE — Replay';
+  if (q.get("live") === "mnq") {
+    await startOriginalLive(app);
+    return;
+  }
+  if (q.get("sierra") === "mnq") {
+    await startSierraHistory(app);
+    return;
+  }
   const loading = el("div", "loading", app);
   if (!sessionName) {
     // the most recently built session, recorded by tools/session.py; the repo sample otherwise
@@ -63,12 +77,19 @@ async function main(): Promise<void> {
     hbr = await load();
   }
   const session = new Session(hbr);
-  try {
-    const r = await fetch(`/sessions/${sessionName}.collector.json`);
-    if (r.ok) session.collector = (await r.json()) as CollectorFacts;
-  } catch {
-    /* optional */
-  }
+  await Promise.all([
+    (async () => {
+      const r = await fetch(`/sessions/${sessionName}.collector.json`);
+      if (r.ok) session.collector = (await r.json()) as CollectorFacts;
+    })().catch(() => { /* optional crypto collector */ }),
+    (async () => {
+      const r = await fetch(`/sessions/${sessionName}.sierra.json`);
+      if (r.ok) {
+        const facts = await r.json() as SierraFacts;
+        if (typeof facts.source === "string" && Number.isFinite(facts.trade_records)) session.sierraCollector = facts;
+      }
+    })().catch(() => { /* optional Sierra provenance */ }),
+  ]);
   loading.remove();
   new App(app, session).start();
 }
@@ -91,6 +112,7 @@ class App {
   private frameH = 0;
   private zoom = 1;
   private lastRenderKey = "";
+  private readonly performance:PerformanceGrid;
 
   constructor(
     root: HTMLElement,
@@ -106,6 +128,7 @@ class App {
       new LogPanel(s),
       new EnginePanel(s),
       new CollectorPanel(s),
+      new WeekPanel(s),
     ];
     for (const p of this.panels) this.byKey.set(p.key, p);
     this.clock = new ReplayClock(s.endT);
@@ -137,6 +160,7 @@ class App {
     }
     this.safeTop = el("div", "safe", root);
     this.header = el("div", "bar", root);
+    addModeNavigation(root, "replay");
     this.work = el("div", "work", root);
     this.status = el("div", "bar status", root);
     this.keys = el("div", "bar", root);
@@ -152,11 +176,13 @@ class App {
       sp("k", "B") + " ladder  " +
       sp("k", "H") + " keys";
 
+    this.performance=new PerformanceGrid(root,"session");
     this.clock.speed = parseFloat(q.get("speed") ?? "1") || 1;
     this.clock.seek((parseFloat(q.get("t") ?? "0") || 0) * 1e9);
     if (q.get("play") !== "0") this.clock.play();
     this.applyLayout();
     window.addEventListener("resize", () => this.applyLayout());
+    root.addEventListener('weekdock',()=>{this.focus=null;this.layout='landscape';this.applyLayout();});
     window.addEventListener("keydown", (e) => this.onKey(e));
     this.clock.onChange = () => this.syncUrl();
   }
@@ -188,7 +214,7 @@ class App {
     if (!portrait) this.work.style.gridTemplateRows = "";
     for (const p of visible) {
       p.el.style.gridArea = this.work.classList.contains("landscape") ? p.key : "auto";
-      this.work.appendChild(p.el);
+      p.mount(this.work);
       p.invalidate();
     }
     this.keys.style.display = this.showKeys ? "" : "none";
@@ -196,7 +222,11 @@ class App {
     const cols = Math.floor(this.header.clientWidth / 9);
     const wide = cols >= 110;
     const medium = cols >= 72;
-    this.header.innerHTML =
+    const sierraSession = /^MNQZ26-CME(?:\[M\])?$/i.test(m.symbol) && String(m.source_note ?? "").includes("Sierra");
+    this.header.innerHTML = sierraSession
+      ? sp("hi", " HFTENGINE ") + ` Sierra backtest  │  ${m.symbol}  │  `
+        + '<span class="sierra-engine-state y"></span>'
+      :
       sp("hi", " HFTENGINE ") +
       ` ${m.engine.name} ${m.engine.crate_version}  │  ${m.symbol}` +
       (medium ? ` · ${m.exchange}  │  recorded ${dateOf(s.t0)}` : "") +
@@ -293,12 +323,16 @@ class App {
     const s = this.s;
     const t = this.clock.t;
     const f = s.frameAt(t);
+    this.performance.updateSession(s,t);
     const ctx: RenderCtx = { t, f, playing: this.clock.playing, speed: this.clock.speed };
     for (const p of this.panels) if (p.el.isConnected) p.render(ctx);
-    const key = `${Math.floor(t / 1e8)}|${this.clock.playing}|${this.clock.speed}`;
+    const key = `${Math.floor(t / 1e8)}|${t >= s.endT}|${this.clock.playing}|${this.clock.speed}`;
     if (key !== this.lastRenderKey) {
       this.lastRenderKey = key;
-      const pos = s.position[f];
+      const engineState = this.header.querySelector(".sierra-engine-state");
+      if (engineState) engineState.textContent = this.clock.playing ? "Sierra engine is running" : "Sierra engine is waiting for trades";
+      const accounting = s.accountingAt(t);
+      const pos = accounting.position;
       const cols = Math.floor(this.status.clientWidth / 9);
       const medium = cols >= 90;
       this.status.innerHTML =
@@ -308,7 +342,8 @@ class App {
         sp("v", `x${this.clock.speed}`) +
         `  │  ${medium ? "elapsed " : ""}${sp("v", elapsed(t))}${medium ? " of " : "/"}${elapsed(s.endT)}` +
         `  │  pos${medium ? "ition" : ""} ${sp(pos > 0 ? "g" : pos < 0 ? "r" : "v", (pos >= 0 ? "+" : "") + pos.toFixed(3))}` +
-        `  │  ${sp("v", String(s.numTrades[f]))} fills` +
+        `  │  ${sp("v", String(accounting.fills))} fills` +
+        (accounting.terminal ? sp("d", "  │ terminal accounting · book: last sampled") : "") +
         (medium ? sp("right", `${this.layout}${this.focus ? " · " + this.focus : ""} `) : "");
       if (this.clock.playing && Math.floor(t / 1e9) % 5 === 0) this.syncUrl();
     }

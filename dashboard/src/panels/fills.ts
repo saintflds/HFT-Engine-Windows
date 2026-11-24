@@ -1,3 +1,4 @@
+import {sierraPanel} from '../sierra-panels';
 /** FILLS: our executions with how long the order rested in the queue, what was ahead of it when
  * it was accepted, what traded at the level meanwhile, and the gap between the first trade at our
  * price ("touch") and the fill. */
@@ -18,6 +19,7 @@ export class FillsPanel extends Panel {
 
   render(c: RenderCtx): void {
     const s = this.s;
+    const account=sierraPanel(s,'fills');if(account){this.body.innerHTML=account.html;this.setTitle(account.title);return;}
     const evN = s.eventsUpTo(c.t);
     const key = `${evN}|${this.rows}|${this.cols}`;
     if (!this.changed(key)) return;
@@ -69,7 +71,7 @@ export class FillsPanel extends Panel {
             : ""),
       );
     }
-    if (nFill === 0) out.push(sp("d", "no executions yet"));
+    if (nFill === 0) out.push(sp("d", s.meta.live?.sim.status==='off'?"Engine orders OFF — enable Orders above":s.meta.live?"No engine fills yet; waiting for a matching trade.":"no executions yet"));
     this.body.innerHTML = out.join("\n");
     const ws = Float64Array.from(waits).sort();
     const med = ws.length ? ws[ws.length >> 1] : NaN;
