@@ -22,8 +22,12 @@ The live dashboard reads Sierra market-data publications and can run engine pape
 strategies against them. Historical sessions run through the Rust backtest engine.
 Order routing from the application into Sierra Sim1 or a live broker remains pending.
 
-1. **Fees.** The historical runner and paper simulator account for configured costs.
-   Check the per-contract fee, order quantity and instrument settings for each run.
+1. **Fees.** The MNQ historical converter defaults to $0.75 per contract per side.
+   The sampled-feed paper simulator also uses $0.75 per contract per side. One
+   entry and one exit therefore incur $1.50 in modeled fees for one contract.
+   The historical converter accepts `--fee-per-contract` to change its assumption.
+   These values are engine settings. Use your actual commission and exchange-fee
+   schedule when evaluating a historical run.
 2. **Latency.** Historical entry and response delays are modeled inputs. Live feed
    timestamps and publication freshness affect the paper engine's view of the market.
    Broker acknowledgments and end-to-end live execution latency still need integration
@@ -34,6 +38,36 @@ Order routing from the application into Sierra Sim1 or a live broker remains pen
 4. **P&L is simulated.** The engine tracks position, balance, fees and net equity for
    historical and paper runs. The Sierra account view also displays the simulated
    account information supplied by the native publisher.
+
+MNQ and NQ contract values provide the units for prices, fills and P&L.
+
+| Contract | Dollar value per index point | Minimum outright price increment | Dollar value of one tick per contract |
+| --- | --- | --- | --- |
+| Micro E-mini Nasdaq-100 (`MNQ`) | $2.00 | 0.25 index points | $0.50 |
+| E-mini Nasdaq-100 (`NQ`) | $20.00 | 0.25 index points | $5.00 |
+
+These contract specifications were checked against CME's contract descriptions.
+Sources are [CME MNQ](https://www.cmegroup.com/markets/equities/nasdaq/micro-e-mini-nasdaq-100.settlements.html)
+and [CME NQ](https://www.cmegroup.com/markets/equities/nasdaq/e-mini-nasdaq-100.contractSpecs.html).
+
+For an illustrative one-contract long entry at 25,000.00 and exit at 25,001.00,
+the one-point move is four ticks. Gross P&L is $2.00 for MNQ and $20.00 for NQ.
+With the engine's $0.75-per-side MNQ fee assumption, the MNQ example has $0.50 net
+P&L before slippage. These prices illustrate the calculation and are separate
+from recorded engine results and current market prices.
+
+For one MNQ contract, the $1.50 modeled round-trip fee equals three ticks.
+If a model additionally charges one tick of adverse slippage at both entry and
+exit, those two ticks cost another $1.00. Combined friction in that example is
+$2.50, or five MNQ ticks. The standalone bar-based EMA model exposes a slippage
+setting and moves its simulated entry and exit prices accordingly.
+
+The Windows converter and bar-based model currently use MNQ's $2 point value.
+The paper simulator accepts `MNQZ26-CME` and its optional `[M]` suffix with a
+0.25 tick size. NQ values in this table provide contract context. NQ execution,
+other MNQ expiries in the paper path, and contract rollover need dedicated
+configuration and verification. The generic Rust runner exposes a contract-size
+argument, while the Windows Sierra converter supplies MNQ settings explicitly.
 
 The shared paper-execution kill switch blocks new simulated routing, cancels through
 the simulator, persists stop state and requires operator authorization to reset.
@@ -64,10 +98,30 @@ HFT-Engine-Windows/
 | Engine paper orders and fills | Local execution simulation driven by observed frames, with modeled queues, delays, fills and cancellations. |
 | Historical MNQ order book | Recorded Sierra depth files, or saved best quotes reconstructed from SCID ticks in quote-only mode. |
 | Historical strategy | Rust runner with queue, grid and EMA strategies, configured fees, latency and sizing. |
-| Binance replay | Locally collected public streams converted into historical inputs and HBR recordings. |
+| Replay provenance | Companion metadata records the source, instrument and conversion assumptions used to produce each local session. |
 | Paper risk controls | Shared server kill switch, exposure checks, configured loss/disconnection triggers and authorization at the simulated routing boundary. |
 | Journaling and learning | Local journals, adaptive outcomes, training examples and predictor qualification checks. Predictor use depends on qualification and compatible inputs. |
 | Daily performance | Saved paper journals and recorded replay accounting, subject to costs, coverage and replay-time rules. |
+
+The historical Sierra builder supplies a `RiskAdverseQueueModel`, one-contract
+order quantity, one-contract maximum position, a 0.25 tick size and a $2 point
+value. Its default entry and response delays are 10,000 microseconds each
+(10 ms entry plus 10 ms response). The paper simulator also defaults to 10 ms
+entry and response delays. These are simulation assumptions and require separate
+measurement before comparison with a live broker execution path.
+
+Quote-only replay reconstructs saved best bid and ask with one assumed contract
+at each price. Native depth replay reconstructs the initial book and applies
+recorded depth updates. Both paths validate their inputs, while their available
+observations determine what can be modeled. The standalone EMA lab operates on
+minute bars, uses completed-bar signals and next-observed-open execution, applies
+its configured costs, and handles gaps and session boundaries.
+
+The live paper engine processes source-time prints, deduplicates overlapping tape,
+tracks exchange-effective and acknowledged state, and models delayed responses.
+Its synthetic tests cover cancellation/fill races, pending exposure and late
+responses. A stale or interrupted feed suspends new routing. Source transitions
+and replay rewinds also require simulation-state handling.
 
 Recorded market data, account settings, model files, trading journals and generated
 replay sessions are excluded from the GitHub source repository.
@@ -107,8 +161,18 @@ cargo build --release --locked --manifest-path runner/Cargo.toml
 
 The optional `tools/setup-sierra-python.ps1` helper prepares the local environment
 and installs the pinned NumPy dependency for `tools/hbr.py`. That helper was previously
-verified with Python 3.15.1 on Windows x64. The upstream Binance Python conversion
-stack requires additional packages and compatible Python versions.
+verified with Python 3.15.1 on Windows x64. The standard-library Sierra converter can
+prepare historical inputs independently of NumPy. Full replay generation additionally
+needs the built Rust runner at `runner/target/release/hftengine-runner.exe`.
+
+```powershell
+# Optional local environment for recording inspection
+powershell -NoProfile -File tools/setup-sierra-python.ps1
+.venv/Scripts/python.exe tools/hbr.py data/recordings/mnq_20261023_1330_depth_queue_30min.hbr
+```
+
+The filename is an example of a session you generate locally. A source clone
+contains the tooling and tests, and requires local recordings for replay.
 
 The native Sierra build helper at `tools/sierra/build.cmd` uses a local Visual Studio
 Build Tools path and sibling `SierraChart/ACS_Source` headers. Check these installation
@@ -123,53 +187,105 @@ Compiling the study, configuring an active Sierra chart and verifying its public
 are separate local setup steps. Full active-chart integration remains unverified in
 the GitHub setup.
 
-The original Binance collector remains available after preparing its collector binary
-and Python environment.
+The expected local recording layout for the example MNQ contract is shown below.
+Use the Sierra symbol and contract month that match your own archive.
 
-```powershell
-.venv/Scripts/python.exe tools/collect.py start --symbols BTCUSDT ETHUSDT
-.venv/Scripts/python.exe tools/collect.py status
-.venv/Scripts/python.exe tools/collect.py stop
+```
+SierraChart/Data/
+  MNQZ26-CME.scid
+  MarketDepthData/
+    MNQZ26-CME.2026-10-23.depth
+
+HFT-Engine-Windows/data/
+  sierra/latest.json
+  npz/
+  recordings/
+  kill-switch/
 ```
 
-Public-stream recordings are written under `data/raw/`. Keep recordings and licensed
-market data in local storage. The repository excludes recorded sample sessions too.
+The `.scid` file supplies native tick records. The `.depth` file supplies the
+matching day's order-book updates. Quote-only conversion uses saved best quotes
+from the tick file. Native depth conversion requires suitable depth coverage and
+a usable starting snapshot for the selected time window.
+
+The publisher supplies chart symbol, connection and replay state, tick size,
+depth, prints and selected simulated-account information. The browser receives
+publications through the local server's stream. The publisher's source disables
+trade-service order sending. Compiling that source and observing its output in an
+active Sierra instance are distinct verification steps.
+
+The repository retains the original public-stream collector utilities as a
+separate workflow. The Windows examples here use MNQ recordings through Sierra.
+Keep tick archives, recordings, local account files and licensed market data on
+the Windows machine. The source repository's ignore rules exclude these inputs.
 
 ## Build a session and replay it
 
-Use a local recording you are authorized to use and a built historical runner.
-The Binance conversion workflow also requires its upstream Python dependencies.
+Use an authorized local MNQ archive and a built historical runner. The following
+example uses October 23, 2026 at 13:30 UTC for 30 minutes. Choose a window actually
+covered by your own files. It is an explicit historical time and does not adjust
+automatically to the current date or a market session's daylight-saving rules.
 
 ```powershell
-.venv/Scripts/python.exe tools/session.py --raw data/raw/btcusdt_20260915.gz --name btcusdt_20260915
+python tools/sierra/session.py --source depth --symbol MNQZ26-CME --date 2026-10-23 --start 13:30 --minutes 30 --strategy queue --fee-per-contract 0.75 --latency-us 10000,10000 --name mnq_20261023_1330_depth_queue_30min --data-folder "D:/Market Project - Testing/SierraChart/Data"
 cd dashboard
 npm.cmd run dev
 ```
 
-Open `http://127.0.0.1:5180/?session=btcusdt_20260915` after the build completes.
-The builder converts the recording, derives latency, runs the engine and stages
-the HBR output and provenance files in `dashboard/public/sessions/`.
+After generation completes, open
+`http://127.0.0.1:5180/?session=mnq_20261023_1330_depth_queue_30min`.
+The historical converter validates file format and coverage, prepares normalized
+events, runs the Rust strategy, records frames and stages the replay outputs.
 
 | session | content |
 | --- | --- |
-| Binance replay | A named session built from locally collected public streams. |
-| Sierra depth replay | A named MNQ session built from SCID trades and matching native depth files. |
-| Sierra quote replay | A named session built from SCID trades and saved best quotes, assuming one contract at each observed best bid/ask. |
+| `mnq_20261023_1330_depth_queue_30min` | Example native-depth queue replay using the selected SCID and depth files. |
+| `mnq_20261023_1330_quotes_queue_30min` | Example quote-only queue replay, with one assumed contract at each saved best bid and ask. |
+| MNQ grid or EMA replay | Change `--strategy` to `grid` or `ema` and give the output a distinct session name. |
 
 On `Test`, open `/?sierra=mnq` for the historical Sierra builder. It defaults to
-30 minutes for queue, grid and EMA strategies. Quote-only runs support up to 60 minutes.
-The selected Sierra chart bar period controls its display independently of this window.
+30 minutes for queue, grid and EMA strategies. Quote-only runs support up to
+60 minutes. EMA conversion requires at least 22 minutes because its initial
+21 completed minute bars warm up the averages. The Sierra chart bar period
+controls chart display independently of the requested replay window.
 
 ```powershell
-python tools/sierra/session.py --source quotes --date 2026-10-23 --start 13:30 --minutes 30 --strategy queue --name mnq_20261023_1330_quotes_queue_30min --data-folder "D:/Market Project - Testing/SierraChart/Data"
+# Quote-only historical replay
+python tools/sierra/session.py --source quotes --symbol MNQZ26-CME --date 2026-10-23 --start 13:30 --minutes 30 --strategy queue --name mnq_20261023_1330_quotes_queue_30min --data-folder "D:/Market Project - Testing/SierraChart/Data"
+
+# Validate and prepare the same quote input without launching the Rust runner
+python tools/sierra/session.py --prepare-only --source quotes --symbol MNQZ26-CME --date 2026-10-23 --start 13:30 --minutes 30 --strategy queue --name mnq_20261023_1330_quotes_prepared --data-folder "D:/Market Project - Testing/SierraChart/Data"
 ```
 
-Choose a symbol, date and time covered by your local archive. `--start` uses UTC.
-Native `--source depth` requires matching depth files and a valid starting snapshot.
-Open `/?session=mnq_20261023_1330_quotes_queue_30min` after generation completes.
+| Builder option | Meaning |
+| --- | --- |
+| `--source depth` | Native recorded-depth reconstruction with matching tick and depth inputs. |
+| `--source quotes` | Best-quote reconstruction from the selected tick file. |
+| `--date`, `--start`, `--minutes` | Historical date, UTC start time and replay duration. |
+| `--symbol` | MNQ contract symbol matching the archive, such as `MNQZ26-CME`. |
+| `--strategy` | `queue`, `grid` or `ema`. |
+| `--fee-per-contract` | USD per contract per side. Default is $0.75. |
+| `--latency-us` | Entry and response delays in whole microseconds. Default is `10000,10000`. |
+| `--data-folder` | Local Sierra archive directory. |
+| `--trade-file`, `--depth-file` | Explicit input file paths when the archive uses a different layout. |
+| `--name` | Distinct session identifier for generated outputs. |
+| `--prepare-only` | Validate and write normalized input and provenance without invoking the runner. |
 
-`python tools/hbr.py data/recordings/<name>.hbr moments` lists replay moments in
-a local recording and requires the NumPy dependency.
+Prepared events are saved under `data/npz/`. The HBR recording is saved under
+`data/recordings/`, and generated replay assets are staged in
+`dashboard/public/sessions/`. Companion Sierra metadata describes the conversion
+and its source assumptions. Earlier provenance paths describe the machine that
+produced a recording. Select current input locations explicitly when moving copies.
+
+```powershell
+.venv/Scripts/python.exe tools/hbr.py data/recordings/mnq_20261023_1330_depth_queue_30min.hbr
+.venv/Scripts/python.exe tools/hbr.py data/recordings/mnq_20261023_1330_depth_queue_30min.hbr moments
+```
+
+The inspection utility requires NumPy. Replay counts are evaluated at the current
+playhead, so an intermediate fill or cancellation count can differ from the full
+session total. Terminal accounting and source metadata should be checked together
+when reviewing a run.
 
 ## Dashboard
 
@@ -201,13 +317,42 @@ Replay keys include `SPACE` for play/pause, `Left/Right` to seek five seconds,
 the key bar. Replay settings are reflected in the URL.
 
 The live view provides paper strategy controls, journaling, daily performance and
-an emergency stop. Paper order authorization and configurable risk settings are
-described in the kill-switch guide linked above.
+an emergency stop. The server's paper controller enforces its shared stop at the
+simulated routing boundary across dashboard sessions. It tracks cancellation
+outcomes, audits session retirement and reconciles failed cancellations when a
+local simulated session is retired.
+
+| Paper risk setting | Current behavior |
+| --- | --- |
+| `HFTENGINE_KILL_RESET_TOKEN` | Operator-provided reset credential of at least 24 characters. Missing configuration denies reset. Keep the value in the local server environment. |
+| `HFTENGINE_KILL_MAX_LOSS_USD` | Optional positive USD loss limit for individual paper-session marked equity, including recorded fees. Reaching it trips the shared stop. |
+| `HFTENGINE_KILL_ON_DISCONNECT` | Set to `1` to latch a stop after a previously fresh feed disconnects, goes stale or becomes invalid. The default `0` suspends routing during interruption and permits recovery when feed and authorization conditions are met. |
+
+An active stop is persisted in `data/kill-switch/state.json`, and transition events
+are appended to `data/kill-switch/audit.jsonl`. Missing, unreadable or invalid state
+starts blocked. Each server restart requires fresh paper authorization. Reset also
+requires valid state and reconciliation of cancellation failures. The detailed
+operator flow is documented in the kill-switch guide linked above.
+
+Journaling records simulated fills, closed trades, sampled market observations and
+strategy summaries. Retry handling and linked segments support recovery from
+interrupted writes. The learning components collect eligible examples, use
+chronological splits and require qualification before using a compatible predictor.
+Daily performance derives results from recorded journals or replay accounting and
+reports available coverage. The task register records outstanding gaps in these paths.
 
 The GitHub setup passed all 174 dashboard tests, the TypeScript checks and the Vite
 build. The Sierra format suite passed 14 tests and skipped one requiring a built Rust
 runner. GitHub-hosted Windows checks passed for the imported testing source.
-Fresh Rust compilation and active Sierra/broker execution remain outside that verification.
+Coverage includes source-time replay, MNQ contract accounting, overlapping tape,
+fill/cancel races, exposure limits, journal retry/recovery, model qualification,
+historical cutoffs and daily performance calculations. Dedicated kill-switch tests
+exercise authorization, activation, persistence, cancellation failures, session
+retirement, invalid feeds and delayed requests.
+
+Fresh Rust compilation and active Sierra/broker execution remain outside that
+verification. Test totals describe the source import checks recorded during setup.
+Check the repository's current Actions run for the result of a newer commit.
 
 ```powershell
 cd dashboard
